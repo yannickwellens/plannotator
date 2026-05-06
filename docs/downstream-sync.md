@@ -26,6 +26,10 @@ Patch files in this repo:
 
 Keep upstream behavior while rebasing this patch. In particular, preserve `clearContextNudge` on plan review decisions and keep `annotate-last` awaiting `getLastAssistantMessageText(ctx)`.
 
+## Pi skill
+
+Pi can load the project skill at `.agents/skills/downstream-fork-sync/SKILL.md`. Use `/skill:downstream-fork-sync` or ask Pi to sync/update the Plannotator fork while preserving the downstream patch stack.
+
 ## Normal sync flow
 
 ```bash
