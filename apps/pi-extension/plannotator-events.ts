@@ -14,6 +14,7 @@ import {
 	startLastMessageAnnotationSession,
 	startMarkdownAnnotationSession,
 	startPlanReviewBrowserSession,
+	type PlanReviewBrowserSession,
 } from "./plannotator-browser.js";
 
 export const PLANNOTATOR_REQUEST_CHANNEL = "plannotator:request" as const;
@@ -48,10 +49,17 @@ export type PlannotatorResponse<T> =
 	| PlannotatorUnavailableResponse
 	| PlannotatorErrorResponse;
 
+export interface PlannotatorRequestSessionRef {
+	sessionFile?: string;
+	leafId?: string;
+	cwd?: string;
+}
+
 export interface PlannotatorRequestBase<A extends PlannotatorAction, P, R> {
 	requestId: string;
 	action: A;
 	payload: P;
+	session?: PlannotatorRequestSessionRef;
 	respond: (response: PlannotatorResponse<R>) => void;
 }
 
@@ -74,6 +82,7 @@ export interface PlannotatorReviewResultEvent {
 	agentSwitch?: string;
 	permissionMode?: string;
 	clearContextNudge?: boolean;
+	session?: PlannotatorRequestSessionRef;
 }
 
 export interface PlannotatorReviewStatusPayload {
@@ -198,21 +207,90 @@ function createActiveSessionContext() {
 	};
 }
 
+const CLAIM_TTL_MS = 5 * 60_000;
+const GLOBAL_STATE_KEY = Symbol.for("plannotator.pi.event-listener-state");
+
+type PlannotatorGlobalState = {
+	handledRequestIds: Map<string, ReturnType<typeof setTimeout>>;
+};
+
+function getGlobalState(): PlannotatorGlobalState {
+	const root = globalThis as typeof globalThis & {
+		[GLOBAL_STATE_KEY]?: PlannotatorGlobalState;
+	};
+	root[GLOBAL_STATE_KEY] ??= { handledRequestIds: new Map() };
+	return root[GLOBAL_STATE_KEY];
+}
+
+export function getSessionRef(ctx: ExtensionContext): PlannotatorRequestSessionRef {
+	return {
+		sessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
+		leafId: ctx.sessionManager.getLeafId() ?? undefined,
+		cwd: ctx.cwd,
+	};
+}
+
+export function matchesRequestSession(
+	requestSession: PlannotatorRequestSessionRef | undefined,
+	activeSession: PlannotatorRequestSessionRef,
+): boolean {
+	if (!requestSession?.sessionFile) return true;
+	return requestSession.sessionFile === activeSession.sessionFile;
+}
+
+export function claimPlannotatorRequest(requestId: string): boolean {
+	const state = getGlobalState();
+	if (state.handledRequestIds.has(requestId)) return false;
+	const timeout = setTimeout(() => {
+		state.handledRequestIds.delete(requestId);
+	}, CLAIM_TTL_MS);
+	state.handledRequestIds.set(requestId, timeout);
+	return true;
+}
+
+export function releasePlannotatorRequestClaim(requestId: string): void {
+	const state = getGlobalState();
+	const timeout = state.handledRequestIds.get(requestId);
+	if (timeout) clearTimeout(timeout);
+	state.handledRequestIds.delete(requestId);
+}
+
 export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 	const activeSessionContext = createActiveSessionContext();
+	const activePlanReviewSessions = new Set<PlanReviewBrowserSession>();
+	let cleanedUp = false;
+
+	const cleanup = () => {
+		if (cleanedUp) return;
+		cleanedUp = true;
+		unsubscribeRequest();
+		for (const session of activePlanReviewSessions) session.stop();
+		activePlanReviewSessions.clear();
+		activeSessionContext.clear();
+	};
 
 	// Plannotator event requests are handled against the latest active session.
 	// The active context is intentionally session-scoped and replaced on each session_start.
 	pi.on("session_start", async (_event, ctx) => {
 		activeSessionContext.set(ctx);
 	});
-	pi.events.on(PLANNOTATOR_REQUEST_CHANNEL, async (data) => {
+	pi.on("session_shutdown", async () => {
+		cleanup();
+	});
+	const unsubscribeRequest = pi.events.on(PLANNOTATOR_REQUEST_CHANNEL, async (data) => {
 		const request = data as Partial<PlannotatorRequest> | null;
 		const ctx = activeSessionContext.get();
 
-		if (!request || typeof request.respond !== "function" || !isPlannotatorAction(request.action)) {
+		if (
+			!request ||
+			typeof request.requestId !== "string" ||
+			typeof request.respond !== "function" ||
+			!isPlannotatorAction(request.action)
+		) {
 			return;
 		}
+
+		let claimAcquired = false;
 
 		try {
 			if (request.action === "review-status") {
@@ -230,16 +308,25 @@ export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 				return;
 			}
 
+			const activeSession = getSessionRef(ctx);
+			if (!matchesRequestSession(request.session, activeSession)) return;
+			if (!claimPlannotatorRequest(request.requestId)) return;
+			claimAcquired = true;
+
 			switch (request.action) {
 				case "plan-review": {
 					const planContent = request.payload?.planContent;
 					if (typeof planContent !== "string" || !planContent.trim()) {
+						releasePlannotatorRequestClaim(request.requestId);
 						request.respond({ status: "error", error: "Missing planContent for plan-review request." });
 						return;
 					}
+					const capturedSession = activeSession;
 					const session = await startPlanReviewBrowserSession(ctx, planContent);
+					activePlanReviewSessions.add(session);
 					setStoredReviewStatus(session.reviewId, { status: "pending" });
 					session.onDecision((result) => {
+						activePlanReviewSessions.delete(session);
 						const reviewResult = {
 							reviewId: session.reviewId,
 							approved: result.approved,
@@ -248,6 +335,7 @@ export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 							agentSwitch: result.agentSwitch,
 							permissionMode: result.permissionMode,
 							clearContextNudge: result.clearContextNudge,
+							session: capturedSession,
 						} satisfies PlannotatorReviewResultEvent;
 						setStoredReviewStatus(session.reviewId, { status: "completed", ...reviewResult });
 						pi.events.emit(PLANNOTATOR_REVIEW_RESULT_CHANNEL, reviewResult);
@@ -274,6 +362,7 @@ export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 				case "annotate": {
 					const payload = request.payload;
 					if (!payload?.filePath) {
+						releasePlannotatorRequestClaim(request.requestId);
 						request.respond({ status: "error", error: "Missing filePath for annotate request." });
 						return;
 					}
@@ -293,8 +382,9 @@ export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 				}
 				case "annotate-last": {
 					const payload = request.payload;
-					const lastText = payload?.markdown?.trim() ? payload.markdown : getLastAssistantMessageText(ctx);
+					const lastText = payload?.markdown?.trim() ? payload.markdown : await getLastAssistantMessageText(ctx);
 					if (!lastText) {
+						releasePlannotatorRequestClaim(request.requestId);
 						request.respond({ status: "unavailable", error: "No assistant message found in session." });
 						return;
 					}
@@ -309,6 +399,7 @@ export function registerPlannotatorEventListeners(pi: ExtensionAPI): void {
 				}
 			}
 		} catch (err) {
+			if (claimAcquired) releasePlannotatorRequestClaim(request.requestId);
 			const message = getStartupErrorMessage(err);
 			if (/unavailable|not available/i.test(message)) {
 				request.respond({ status: "unavailable", error: message });
